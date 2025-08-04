@@ -5,6 +5,9 @@
 (define-constant err-unauthorized (err u103))
 (define-constant err-invalid-stage (err u104))
 (define-constant err-invalid-transfer (err u105))
+(define-constant err-product-recalled (err u106))
+(define-constant err-recall-not-found (err u107))
+(define-constant err-recall-already-exists (err u108))
 
 (define-map products
     { product-id: uint }
@@ -40,8 +43,34 @@
     }
 )
 
+(define-map product-recalls
+    { recall-id: uint }
+    {
+        product-id: uint,
+        reason: (string-ascii 200),
+        severity: (string-ascii 20),
+        initiated-by: principal,
+        initiated-at: uint,
+        status: (string-ascii 20),
+        affected-batches: (string-ascii 100),
+    }
+)
+
+(define-map recall-acknowledgments
+    {
+        recall-id: uint,
+        actor: principal,
+    }
+    {
+        acknowledged-at: uint,
+        action-taken: (string-ascii 100),
+        notes: (string-ascii 200),
+    }
+)
+
 (define-data-var next-product-id uint u1)
 (define-data-var next-event-id uint u1)
+(define-data-var next-recall-id uint u1)
 
 (define-public (authorize-actor
         (actor principal)
@@ -129,6 +158,7 @@
         (asserts! (or (is-eq tx-sender contract-owner) (is-authorized tx-sender))
             err-unauthorized
         )
+        (asserts! (not (is-product-recalled product-id)) err-product-recalled)
         (map-set products { product-id: product-id }
             (merge product-data { current-stage: new-stage })
         )
@@ -169,6 +199,7 @@
             )
             err-unauthorized
         )
+        (asserts! (not (is-product-recalled product-id)) err-product-recalled)
         (map-set products { product-id: product-id }
             (merge product-data { current-owner: new-owner })
         )
@@ -269,13 +300,15 @@
     )
 )
 
-(define-public (batch-update-stages (updates (list 20
+(define-public (batch-update-stages (updates (list
+    20
     {
-    product-id: uint,
-    stage: (string-ascii 50),
-    location: (string-ascii 100),
-    notes: (string-ascii 200),
-})))
+        product-id: uint,
+        stage: (string-ascii 50),
+        location: (string-ascii 100),
+        notes: (string-ascii 200),
+    }
+)))
     (begin
         (asserts! (or (is-eq tx-sender contract-owner) (is-authorized tx-sender))
             err-unauthorized
@@ -329,4 +362,133 @@
         (var-set next-event-id (+ event-id u1))
         (ok true)
     )
+)
+
+(define-read-only (is-product-recalled (product-id uint))
+    (get found
+        (fold check-recall-for-product (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) {
+            product-id: product-id,
+            found: false,
+        })
+    )
+)
+
+(define-private (check-recall-for-product
+        (recall-id uint)
+        (state {
+            product-id: uint,
+            found: bool,
+        })
+    )
+    (let ((product-id (get product-id state)))
+        (if (get found state)
+            state
+            (match (map-get? product-recalls { recall-id: recall-id })
+                recall-data (if (and
+                        (is-eq (get product-id recall-data) product-id)
+                        (is-eq (get status recall-data) "active")
+                    )
+                    {
+                        product-id: product-id,
+                        found: true,
+                    }
+                    state
+                )
+                state
+            )
+        )
+    )
+)
+
+(define-public (initiate-product-recall
+        (product-id uint)
+        (reason (string-ascii 200))
+        (severity (string-ascii 20))
+        (affected-batches (string-ascii 100))
+    )
+    (let (
+            (recall-id (var-get next-recall-id))
+            (product-data (unwrap! (map-get? products { product-id: product-id }) err-not-found))
+        )
+        (asserts! (or (is-eq tx-sender contract-owner) (is-authorized tx-sender))
+            err-unauthorized
+        )
+        (asserts!
+            (map-insert product-recalls { recall-id: recall-id } {
+                product-id: product-id,
+                reason: reason,
+                severity: severity,
+                initiated-by: tx-sender,
+                initiated-at: stacks-block-height,
+                status: "active",
+                affected-batches: affected-batches,
+            })
+            err-recall-already-exists
+        )
+        (map-set products { product-id: product-id }
+            (merge product-data {
+                current-stage: "RECALLED",
+                is-verified: false,
+            })
+        )
+        (var-set next-recall-id (+ recall-id u1))
+        (ok recall-id)
+    )
+)
+
+(define-public (acknowledge-recall
+        (recall-id uint)
+        (action-taken (string-ascii 100))
+        (notes (string-ascii 200))
+    )
+    (let ((recall-data (unwrap! (map-get? product-recalls { recall-id: recall-id })
+            err-recall-not-found
+        )))
+        (asserts! (or (is-eq tx-sender contract-owner) (is-authorized tx-sender))
+            err-unauthorized
+        )
+        (asserts!
+            (map-insert recall-acknowledgments {
+                recall-id: recall-id,
+                actor: tx-sender,
+            } {
+                acknowledged-at: stacks-block-height,
+                action-taken: action-taken,
+                notes: notes,
+            })
+            err-already-exists
+        )
+        (ok true)
+    )
+)
+
+(define-public (resolve-recall (recall-id uint))
+    (let ((recall-data (unwrap! (map-get? product-recalls { recall-id: recall-id })
+            err-recall-not-found
+        )))
+        (asserts! (or (is-eq tx-sender contract-owner) (is-authorized tx-sender))
+            err-unauthorized
+        )
+        (ok (map-set product-recalls { recall-id: recall-id }
+            (merge recall-data { status: "resolved" })
+        ))
+    )
+)
+
+(define-read-only (get-recall-info (recall-id uint))
+    (map-get? product-recalls { recall-id: recall-id })
+)
+
+(define-read-only (get-recall-acknowledgment
+        (recall-id uint)
+        (actor principal)
+    )
+    (map-get? recall-acknowledgments {
+        recall-id: recall-id,
+        actor: actor,
+    })
+)
+
+(define-read-only (get-next-recall-id)
+    (var-get next-recall-id)
 )
