@@ -8,6 +8,9 @@
 (define-constant err-product-recalled (err u106))
 (define-constant err-recall-not-found (err u107))
 (define-constant err-recall-already-exists (err u108))
+(define-constant err-auth-code-exists (err u109))
+(define-constant err-auth-code-not-found (err u110))
+(define-constant err-invalid-auth-code (err u111))
 
 (define-map products
     { product-id: uint }
@@ -68,9 +71,46 @@
     }
 )
 
+(define-map product-auth-codes
+    { product-id: uint }
+    {
+        auth-code: (string-ascii 32),
+        generated-at: uint,
+        generated-by: principal,
+        verification-count: uint,
+        last-verified-at: (optional uint),
+    }
+)
+
+(define-map auth-verifications
+    { verification-id: uint }
+    {
+        product-id: uint,
+        auth-code: (string-ascii 32),
+        verifier: principal,
+        timestamp: uint,
+        is-authentic: bool,
+        location: (optional (string-ascii 100)),
+    }
+)
+
+(define-map suspicious-activities
+    { activity-id: uint }
+    {
+        reported-product-id: uint,
+        invalid-auth-code: (string-ascii 32),
+        reporter: principal,
+        timestamp: uint,
+        location: (optional (string-ascii 100)),
+        notes: (string-ascii 200),
+    }
+)
+
 (define-data-var next-product-id uint u1)
 (define-data-var next-event-id uint u1)
 (define-data-var next-recall-id uint u1)
+(define-data-var next-verification-id uint u1)
+(define-data-var next-activity-id uint u1)
 
 (define-public (authorize-actor
         (actor principal)
@@ -491,4 +531,139 @@
 
 (define-read-only (get-next-recall-id)
     (var-get next-recall-id)
+)
+
+(define-public (generate-auth-code
+        (product-id uint)
+        (auth-code (string-ascii 32))
+    )
+    (let ((product-data (unwrap! (map-get? products { product-id: product-id }) err-not-found)))
+        (asserts! (or (is-eq tx-sender contract-owner) (is-authorized tx-sender))
+            err-unauthorized
+        )
+        (asserts!
+            (map-insert product-auth-codes { product-id: product-id } {
+                auth-code: auth-code,
+                generated-at: stacks-block-height,
+                generated-by: tx-sender,
+                verification-count: u0,
+                last-verified-at: none,
+            })
+            err-auth-code-exists
+        )
+        (ok auth-code)
+    )
+)
+
+(define-public (verify-product-authenticity
+        (product-id uint)
+        (auth-code (string-ascii 32))
+        (location (optional (string-ascii 100)))
+    )
+    (let (
+            (verification-id (var-get next-verification-id))
+            (auth-data (map-get? product-auth-codes { product-id: product-id }))
+        )
+        (match auth-data
+            valid-auth (let ((is-authentic (is-eq (get auth-code valid-auth) auth-code)))
+                (asserts!
+                    (map-insert auth-verifications { verification-id: verification-id } {
+                        product-id: product-id,
+                        auth-code: auth-code,
+                        verifier: tx-sender,
+                        timestamp: stacks-block-height,
+                        is-authentic: is-authentic,
+                        location: location,
+                    })
+                    err-already-exists
+                )
+                (if is-authentic
+                    (begin
+                        (map-set product-auth-codes { product-id: product-id }
+                            (merge valid-auth {
+                                verification-count: (+ (get verification-count valid-auth) u1),
+                                last-verified-at: (some stacks-block-height),
+                            })
+                        )
+                        (var-set next-verification-id (+ verification-id u1))
+                        (ok true)
+                    )
+                    (begin
+                        (var-set next-verification-id (+ verification-id u1))
+                        (ok false)
+                    )
+                )
+            )
+            (begin
+                (asserts!
+                    (map-insert auth-verifications { verification-id: verification-id } {
+                        product-id: product-id,
+                        auth-code: auth-code,
+                        verifier: tx-sender,
+                        timestamp: stacks-block-height,
+                        is-authentic: false,
+                        location: location,
+                    })
+                    err-already-exists
+                )
+                (var-set next-verification-id (+ verification-id u1))
+                (ok false)
+            )
+        )
+    )
+)
+
+(define-public (report-suspicious-activity
+        (product-id uint)
+        (invalid-auth-code (string-ascii 32))
+        (location (optional (string-ascii 100)))
+        (notes (string-ascii 200))
+    )
+    (let ((activity-id (var-get next-activity-id)))
+        (asserts!
+            (map-insert suspicious-activities { activity-id: activity-id } {
+                reported-product-id: product-id,
+                invalid-auth-code: invalid-auth-code,
+                reporter: tx-sender,
+                timestamp: stacks-block-height,
+                location: location,
+                notes: notes,
+            })
+            err-already-exists
+        )
+        (var-set next-activity-id (+ activity-id u1))
+        (ok activity-id)
+    )
+)
+
+(define-read-only (get-auth-code (product-id uint))
+    (map-get? product-auth-codes { product-id: product-id })
+)
+
+(define-read-only (get-verification-details (verification-id uint))
+    (map-get? auth-verifications { verification-id: verification-id })
+)
+
+(define-read-only (get-suspicious-activity (activity-id uint))
+    (map-get? suspicious-activities { activity-id: activity-id })
+)
+
+(define-read-only (get-product-verification-stats (product-id uint))
+    (match (map-get? product-auth-codes { product-id: product-id })
+        auth-data (some {
+            verification-count: (get verification-count auth-data),
+            last-verified-at: (get last-verified-at auth-data),
+            generated-at: (get generated-at auth-data),
+            generated-by: (get generated-by auth-data),
+        })
+        none
+    )
+)
+
+(define-read-only (get-next-verification-id)
+    (var-get next-verification-id)
+)
+
+(define-read-only (get-next-activity-id)
+    (var-get next-activity-id)
 )
