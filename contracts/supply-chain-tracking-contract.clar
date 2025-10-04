@@ -11,6 +11,9 @@
 (define-constant err-auth-code-exists (err u109))
 (define-constant err-auth-code-not-found (err u110))
 (define-constant err-invalid-auth-code (err u111))
+(define-constant err-condition-violation (err u112))
+(define-constant err-no-conditions-set (err u113))
+(define-constant err-invalid-range (err u114))
 
 (define-map products
     { product-id: uint }
@@ -106,11 +109,51 @@
     }
 )
 
+(define-map product-conditions
+    { product-id: uint }
+    {
+        min-temp: int,
+        max-temp: int,
+        min-humidity: uint,
+        max-humidity: uint,
+        set-by: principal,
+        set-at: uint,
+    }
+)
+
+(define-map condition-readings
+    { reading-id: uint }
+    {
+        product-id: uint,
+        temperature: int,
+        humidity: uint,
+        recorded-by: principal,
+        recorded-at: uint,
+        location: (optional (string-ascii 100)),
+        is-violation: bool,
+    }
+)
+
+(define-map condition-violations
+    { violation-id: uint }
+    {
+        product-id: uint,
+        reading-id: uint,
+        violation-type: (string-ascii 20),
+        recorded-value: int,
+        expected-range: (string-ascii 50),
+        timestamp: uint,
+        auto-flagged: bool,
+    }
+)
+
 (define-data-var next-product-id uint u1)
 (define-data-var next-event-id uint u1)
 (define-data-var next-recall-id uint u1)
 (define-data-var next-verification-id uint u1)
 (define-data-var next-activity-id uint u1)
+(define-data-var next-reading-id uint u1)
+(define-data-var next-violation-id uint u1)
 
 (define-public (authorize-actor
         (actor principal)
@@ -666,4 +709,192 @@
 
 (define-read-only (get-next-activity-id)
     (var-get next-activity-id)
+)
+
+(define-public (set-product-conditions
+        (product-id uint)
+        (min-temp int)
+        (max-temp int)
+        (min-humidity uint)
+        (max-humidity uint)
+    )
+    (let ((product-data (unwrap! (map-get? products { product-id: product-id }) err-not-found)))
+        (asserts! (or (is-eq tx-sender contract-owner) (is-authorized tx-sender))
+            err-unauthorized
+        )
+        (asserts! (< min-temp max-temp) err-invalid-range)
+        (asserts! (< min-humidity max-humidity) err-invalid-range)
+        (ok (map-set product-conditions { product-id: product-id } {
+            min-temp: min-temp,
+            max-temp: max-temp,
+            min-humidity: min-humidity,
+            max-humidity: max-humidity,
+            set-by: tx-sender,
+            set-at: stacks-block-height,
+        }))
+    )
+)
+
+(define-public (record-condition-reading
+        (product-id uint)
+        (temperature int)
+        (humidity uint)
+        (location (optional (string-ascii 100)))
+    )
+    (let (
+            (reading-id (var-get next-reading-id))
+            (conditions (map-get? product-conditions { product-id: product-id }))
+        )
+        (unwrap! (map-get? products { product-id: product-id }) err-not-found)
+        (match conditions
+            valid-conditions (let (
+                    (temp-violation (or
+                        (< temperature (get min-temp valid-conditions))
+                        (> temperature (get max-temp valid-conditions))
+                    ))
+                    (humidity-violation (or
+                        (< humidity (get min-humidity valid-conditions))
+                        (> humidity (get max-humidity valid-conditions))
+                    ))
+                    (is-violation (or temp-violation humidity-violation))
+                )
+                (asserts!
+                    (map-insert condition-readings { reading-id: reading-id } {
+                        product-id: product-id,
+                        temperature: temperature,
+                        humidity: humidity,
+                        recorded-by: tx-sender,
+                        recorded-at: stacks-block-height,
+                        location: location,
+                        is-violation: is-violation,
+                    })
+                    err-already-exists
+                )
+                (if temp-violation
+                    (try! (log-violation product-id reading-id "temperature"
+                        temperature (get min-temp valid-conditions)
+                        (get max-temp valid-conditions)
+                    ))
+                    true
+                )
+                (if humidity-violation
+                    (try! (log-violation-humidity product-id reading-id
+                        (to-int humidity)
+                        (to-int (get min-humidity valid-conditions))
+                        (to-int (get max-humidity valid-conditions))
+                    ))
+                    true
+                )
+                (var-set next-reading-id (+ reading-id u1))
+                (ok reading-id)
+            )
+            (begin
+                (asserts!
+                    (map-insert condition-readings { reading-id: reading-id } {
+                        product-id: product-id,
+                        temperature: temperature,
+                        humidity: humidity,
+                        recorded-by: tx-sender,
+                        recorded-at: stacks-block-height,
+                        location: location,
+                        is-violation: false,
+                    })
+                    err-already-exists
+                )
+                (var-set next-reading-id (+ reading-id u1))
+                (ok reading-id)
+            )
+        )
+    )
+)
+
+(define-private (log-violation
+        (product-id uint)
+        (reading-id uint)
+        (violation-type (string-ascii 20))
+        (recorded-value int)
+        (min-val int)
+        (max-val int)
+    )
+    (let ((violation-id (var-get next-violation-id)))
+        (asserts!
+            (map-insert condition-violations { violation-id: violation-id } {
+                product-id: product-id,
+                reading-id: reading-id,
+                violation-type: violation-type,
+                recorded-value: recorded-value,
+                expected-range: "temp-range",
+                timestamp: stacks-block-height,
+                auto-flagged: true,
+            })
+            err-already-exists
+        )
+        (var-set next-violation-id (+ violation-id u1))
+        (ok true)
+    )
+)
+
+(define-private (log-violation-humidity
+        (product-id uint)
+        (reading-id uint)
+        (recorded-value int)
+        (min-val int)
+        (max-val int)
+    )
+    (let ((violation-id (var-get next-violation-id)))
+        (asserts!
+            (map-insert condition-violations { violation-id: violation-id } {
+                product-id: product-id,
+                reading-id: reading-id,
+                violation-type: "humidity",
+                recorded-value: recorded-value,
+                expected-range: "humidity-range",
+                timestamp: stacks-block-height,
+                auto-flagged: true,
+            })
+            err-already-exists
+        )
+        (var-set next-violation-id (+ violation-id u1))
+        (ok true)
+    )
+)
+
+(define-read-only (get-product-conditions (product-id uint))
+    (map-get? product-conditions { product-id: product-id })
+)
+
+(define-read-only (get-condition-reading (reading-id uint))
+    (map-get? condition-readings { reading-id: reading-id })
+)
+
+(define-read-only (get-condition-violation (violation-id uint))
+    (map-get? condition-violations { violation-id: violation-id })
+)
+
+(define-read-only (check-current-conditions
+        (product-id uint)
+        (temperature int)
+        (humidity uint)
+    )
+    (match (map-get? product-conditions { product-id: product-id })
+        conditions (ok {
+            temp-in-range: (and
+                (>= temperature (get min-temp conditions))
+                (<= temperature (get max-temp conditions))
+            ),
+            humidity-in-range: (and
+                (>= humidity (get min-humidity conditions))
+                (<= humidity (get max-humidity conditions))
+            ),
+        })
+        err-no-conditions-set
+    )
+)
+
+(define-read-only (get-next-reading-id)
+    (var-get next-reading-id)
+)
+
+(define-read-only (get-next-violation-id)
+    (var-get next-violation-id)
 )
