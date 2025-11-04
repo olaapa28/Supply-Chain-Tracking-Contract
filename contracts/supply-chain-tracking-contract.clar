@@ -49,6 +49,14 @@
     }
 )
 
+(define-map ephemeral-authorizations
+    { actor: principal }
+    {
+        expires-at: uint,
+        active: bool,
+    }
+)
+
 (define-map product-recalls
     { recall-id: uint }
     {
@@ -179,10 +187,49 @@
 )
 
 (define-read-only (is-authorized (actor principal))
-    (match (map-get? authorized-actors { actor: actor })
-        auth-data (get authorized auth-data)
-        false
+    (let (
+            (permanent (map-get? authorized-actors { actor: actor }))
+            (ephemeral (map-get? ephemeral-authorizations { actor: actor }))
+        )
+        (or
+            (match permanent
+                auth-data (get authorized auth-data)
+                false
+            )
+            (match ephemeral
+                token (and (get active token) (>= (get expires-at token) stacks-block-height))
+                false
+            )
+        )
     )
+)
+
+(define-public (grant-ephemeral-authorization
+        (actor principal)
+        (expires-at uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (> expires-at stacks-block-height) err-invalid-range)
+        (ok (map-set ephemeral-authorizations { actor: actor } {
+            expires-at: expires-at,
+            active: true,
+        }))
+    )
+)
+
+(define-public (revoke-ephemeral-authorization (actor principal))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (ok (map-set ephemeral-authorizations { actor: actor } {
+            expires-at: stacks-block-height,
+            active: false,
+        }))
+    )
+)
+
+(define-read-only (get-ephemeral-authorization (actor principal))
+    (map-get? ephemeral-authorizations { actor: actor })
 )
 
 (define-public (register-product
